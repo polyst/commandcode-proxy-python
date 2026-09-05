@@ -15,7 +15,9 @@ from commandcode_proxy.responses import (
     instrument,
     iter_events,
     openai_error,
+    error_brief,
     stream_chunks,
+    upstream_error_payload,
     wants_stream_usage,
 )
 
@@ -271,10 +273,68 @@ def test_upstream_abort_raises_in_non_stream_mode():
         asyncio.run(collect_completion(aiter([{"type": "abort"}]), "r", "m", 1))
 
 
-def test_stream_stops_on_abort_without_a_done_marker():
+def test_stream_aborts_with_an_error_payload_and_a_done_marker():
+    """An abort must not look like a silent empty completion."""
     chunks = drain(stream_chunks(aiter([{"type": "text-delta", "text": "x"}, {"type": "abort"}]),
                                  "r", "m", 1))
-    assert DONE_EVENT not in chunks
+    assert chunks[-1] == DONE_EVENT
+    data = [json.loads(b.decode()[6:]) for b in chunks[:-1]]
+    assert data[-1]["error"]["message"] == "Upstream aborted the request."
+
+
+def test_stream_error_event_is_relayed_to_the_client():
+    """The upstream's own message, code and status code must reach the client."""
+    upstream_error = {"type": "error", "error": {
+        "type": "server_error",
+        "message": "Service temporarily unavailable. Please try again shortly.",
+        "statusCode": 503,
+        "isRetryable": True,
+    }}
+    chunks = drain(stream_chunks(aiter([{"type": "start"}, upstream_error]), "r", "m", 1))
+    assert chunks[-1] == DONE_EVENT
+    data = [json.loads(b.decode()[6:]) for b in chunks[:-1]]
+
+    payload = data[-1]
+    assert set(payload) == {"error"}
+    assert payload["error"]["message"] == "Service temporarily unavailable. Please try again shortly."
+    assert payload["error"]["type"] == "server_error"
+    assert payload["error"]["status"] == 503
+
+
+def test_stream_error_with_a_bare_string_message():
+    chunks = drain(stream_chunks(aiter([{"type": "error", "error": "boom"}]), "r", "m", 1))
+    data = [json.loads(b.decode()[6:]) for b in chunks[:-1]]
+    assert data[-1]["error"] == {"message": "boom", "type": "api_error",
+                                 "param": None, "code": None}
+
+
+def test_upstream_error_payload_shapes():
+    assert upstream_error_payload({"error": "boom"})["error"]["message"] == "boom"
+    assert upstream_error_payload({"error": {}})["error"]["message"] == "upstream error"
+    assert upstream_error_payload({})["error"]["message"] == "upstream error"
+
+    event = {"error": {"type": "server_error", "message": "m", "statusCode": 503}}
+    assert upstream_error_payload(event)["error"]["status"] == 503
+    assert error_brief(event) == "HTTP 503 server_error: m"
+    assert "HTTP" not in error_brief({"error": {"message": "m"}})
+
+
+def test_collect_completion_carries_the_upstream_status():
+    with pytest.raises(UpstreamStreamError) as raised:
+        asyncio.run(collect_completion(
+            aiter([{"type": "error", "error": {"message": "nope", "statusCode": 403}}]), "r", "m", 1))
+    assert raised.value.args[0] == "nope"
+    assert raised.value.status == 403
+    assert UpstreamStreamError("x").status is None
+
+
+def test_stats_records_the_upstream_error():
+    stats = RequestStats()
+    drain(instrument(aiter([{"type": "error",
+                             "error": {"type": "server_error", "message": "503 again", "statusCode": 503}}]),
+                     stats))
+    assert stats.error == "HTTP 503 server_error: 503 again"
+    assert stats.events == 1
 
 
 def test_finish_reason_comes_from_the_upstream_finish_reason():

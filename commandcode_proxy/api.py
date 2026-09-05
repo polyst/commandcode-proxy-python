@@ -72,9 +72,11 @@ def access_line(stats: RequestStats, requested: str, mapped: str, mode: str, sta
     ttft = f" ttft={stats.ttft:.2f}s" if stats.ttft is not None else ""
     finish = f" finish={stats.finish_reason}" if stats.finish_reason else ""
     tools = f" tools={stats.tool_calls}" if stats.tool_calls else ""
+    # Present when the upstream failed and the error was relayed to the client.
+    error = f"  ERROR {ascii_only(stats.error)}" if stats.error else ""
     return (f"[{mode}] {ascii_only(requested)} -> {ascii_only(mapped)}  HTTP {status}  "
             f"{usage_summary(stats.usage)}  {stats.elapsed:.2f}s{ttft}  "
-            f"events={stats.events}{finish}{tools}")
+            f"events={stats.events}{finish}{tools}{error}")
 
 
 def resolve_api_key(authorization: str, default_key: str) -> str | None:
@@ -97,6 +99,14 @@ def resolve_api_key(authorization: str, default_key: str) -> str | None:
 
 def json_error(status: int, message: str, error_type: str) -> JSONResponse:
     return JSONResponse(openai_error(message, error_type), status_code=status)
+
+
+def _upstream_status(exc: Exception) -> int:
+    """Forward the upstream's own status code; 502 when it did not supply one."""
+    status = getattr(exc, "status", None)
+    if isinstance(status, int) and 100 <= status < 600:
+        return status
+    return 502
 
 
 def create_app(
@@ -256,7 +266,7 @@ def create_app(
                                             request_id, model, created)
         except (UpstreamStreamError, httpx.HTTPError) as exc:
             log.error("upstream stream error: %s", ascii_only(exc))
-            return json_error(502, f"Upstream error: {exc}", "api_error")
+            return json_error(_upstream_status(exc), f"Upstream error: {exc}", "api_error")
         finally:
             await upstream.aclose()
         log.info(access_line(stats, requested, model, "chat", "200"))

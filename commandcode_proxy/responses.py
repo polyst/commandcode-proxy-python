@@ -55,6 +55,7 @@ class RequestStats:
     finish_reason: str | None = None
     usage: dict[str, Any] | None = None
     cost: float | None = None
+    error: str | None = None
 
     @property
     def ttft(self) -> float | None:
@@ -96,8 +97,10 @@ async def instrument(events: AsyncIterator[dict[str, Any]],
         elif event_type in ("tool-call", "tool-input-start"):
             stats.tool_calls += 1
         elif event_type == "finish":
-            stats.finish_reason = event.get("finishReason")
+            stats.finish_reason = normalize_finish_reason(event.get("finishReason"))
             stats.usage = build_usage(event.get("totalUsage"), stats.cost)
+        elif event_type == "error":
+            stats.error = error_brief(event)
         elif event_type == "provider-metadata":
             stats.cost = extract_cost(event) or stats.cost
 
@@ -226,8 +229,6 @@ async def stream_chunks(
     tool_call_indexes: dict[str, int] = {}
     usage: dict[str, Any] | None = None
     cost: float | None = None
-    errored = False
-
     async for event in events:
         if is_disconnected is not None and await is_disconnected():
             log.info("client disconnected; aborting upstream stream")
@@ -307,18 +308,23 @@ async def stream_chunks(
             yield DONE_EVENT
 
         elif event_type == "error":
-            errored = True
-            log.error("upstream stream error: %s", event.get("error"))
+            # Relay it. Swallowing this used to leave the client with a 200 and an
+            # empty completion, which every agent renders as "model returned no
+            # content" - far less useful than the upstream's own message.
+            log.error("upstream stream error: %s", error_brief(event))
+            yield encode_sse(upstream_error_payload(event))
+            yield DONE_EVENT
+            return
 
         elif event_type == "abort":
-            log.info("upstream aborted the stream")
+            log.warning("upstream aborted the stream")
+            yield encode_sse(openai_error("Upstream aborted the request.", "api_error"))
+            yield DONE_EVENT
             return
 
         # start, start-step, reasoning-start, reasoning-end, finish-step,
         # provider-metadata without usage, tool-result: nothing to relay.
 
-    if errored:
-        yield DONE_EVENT
 
 
 async def collect_completion(
@@ -403,7 +409,7 @@ async def collect_completion(
             }
 
         elif event_type == "error":
-            raise UpstreamStreamError(_error_message(event))
+            raise UpstreamStreamError(_error_message(event), _error_status(event))
 
         elif event_type == "abort":
             raise UpstreamStreamError("upstream aborted the request")
@@ -431,16 +437,63 @@ def _message(content: str, reasoning: str,
     return message
 
 
-def _error_message(event: dict[str, Any]) -> str:
+def _parse_upstream_error(event: dict[str, Any]) -> tuple[str, str, int | None]:
+    """Unpack the upstream's in-band error into (message, code, status).
+
+    The upstream sends ``{"type": "error", "error": {message, statusCode, type,
+    isRetryable}}``. Both branches of ``error`` (string or object) are handled.
+    """
     error = event.get("error")
     if isinstance(error, str):
-        return error
+        return error, "api_error", None
     if isinstance(error, dict):
         message = error.get("message")
-        if isinstance(message, str):
-            return message
-    return "upstream stream error"
+        message = message if isinstance(message, str) and message else "upstream error"
+        code = error.get("type")
+        code = code if isinstance(code, str) and code else "api_error"
+        status = error.get("statusCode")
+        return message, code, status if isinstance(status, int) else None
+    return "upstream error", "api_error", None
+
+
+def upstream_error_payload(event: dict[str, Any]) -> dict[str, Any]:
+    """The upstream error as an OpenAI error envelope, for streaming responses.
+
+    The status line is already on the wire as 200 by the time this is known, so
+    the envelope carries the upstream's own status code instead. Emitting it as a
+    ``data:`` payload is what lets a client tell "the model returned nothing"
+    apart from "the upstream said 503" - previously this event was swallowed and
+    the client just saw an empty completion.
+    """
+    message, code, status = _parse_upstream_error(event)
+    body = openai_error(message, code)
+    if status is not None:
+        body["error"]["status"] = status
+    return body
+
+
+def error_brief(event: dict[str, Any]) -> str:
+    """A one-line rendering of the upstream error, for the access log."""
+    message, code, status = _parse_upstream_error(event)
+    head = f"HTTP {status}" if status is not None else code
+    return f"{head} {code}: {message}"[:300]
+
+
+def _error_message(event: dict[str, Any]) -> str:
+    return _parse_upstream_error(event)[0]
+
+
+def _error_status(event: dict[str, Any]) -> int | None:
+    return _parse_upstream_error(event)[2]
 
 
 class UpstreamStreamError(Exception):
-    """The upstream reported a terminal error inside the event stream."""
+    """The upstream reported a terminal error inside the event stream.
+
+    ``status`` is the upstream's own status code when it supplied one, so the
+    proxy can surface it rather than flattening everything to a 502.
+    """
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status

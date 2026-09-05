@@ -410,6 +410,78 @@ def test_usage_summary_handles_missing_usage():
          "prompt_tokens_details": {"cached_tokens": 1}})
 
 
+UPSTREAM_503 = ndjson_bytes(
+    '{"type": "start"}',
+    '{"type": "error", "error": {"type": "server_error", '
+    '"message": "Service temporarily unavailable. Please try again shortly.", '
+    '"statusCode": 503, "isRetryable": true}}',
+)
+
+
+def test_stream_relays_the_upstream_error_to_the_client(make_app):
+    """The reported symptom: a mid-stream 503 used to leave the client with an
+    empty completion, which agents report as "model returned no content"."""
+    client, _ = make_app(lambda request: httpx.Response(200, content=UPSTREAM_503),
+                         config=Config(command_code_version=PINNED_VERSION))
+    with client:
+        response = client.post("/v1/chat/completions",
+                               json={**REQUEST, "stream": True}, headers=bearer())
+
+    assert response.status_code == 200
+    blocks = [b for b in response.text.splitlines() if b.strip()]
+    assert blocks[-1] == "data: [DONE]"
+
+    payloads = [json.loads(b[6:]) for b in blocks[:-1]]
+    assert payloads[-1] == {
+        "error": {
+            "message": "Service temporarily unavailable. Please try again shortly.",
+            "type": "server_error",
+            "param": None,
+            "code": None,
+            "status": 503,
+        }
+    }
+    # no chat.completion.chunk was sent, so there is nothing to mistake for a
+    # real (empty) completion
+    assert not any(p.get("object") == "chat.completion.chunk" for p in payloads)
+
+
+def test_non_stream_returns_the_upstream_status_code(make_app):
+    client, _ = make_app(lambda request: httpx.Response(200, content=UPSTREAM_503),
+                         config=Config(command_code_version=PINNED_VERSION))
+    with client:
+        response = client.post("/v1/chat/completions", json=REQUEST, headers=bearer())
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "message": "Upstream error: Service temporarily unavailable. Please try again shortly.",
+        "type": "api_error",
+        "param": None,
+        "code": None,
+    }
+
+
+def test_non_stream_without_a_status_code_falls_back_to_502(make_app):
+    body = ndjson_bytes('{"type": "error", "error": "gateway blew up"}')
+    client, _ = make_app(lambda request: httpx.Response(200, content=body),
+                         config=Config(command_code_version=PINNED_VERSION))
+    with client:
+        response = client.post("/v1/chat/completions", json=REQUEST, headers=bearer())
+    assert response.status_code == 502
+    assert response.json()["error"]["message"] == "Upstream error: gateway blew up"
+
+
+def test_access_line_shows_a_relayed_upstream_error():
+    from commandcode_proxy.api import access_line
+    from commandcode_proxy.responses import RequestStats
+
+    stats = RequestStats()
+    stats.events = 2
+    stats.error = "HTTP 503 server_error: Service temporarily unavailable."
+    line = access_line(stats, "m", "M", "chat stream", "200")
+    assert "ERROR HTTP 503 server_error: Service temporarily unavailable." in line
+
+
 def test_ascii_only_replaces_every_non_ascii_character():
     from commandcode_proxy.api import ascii_only
     assert ascii_only("abc 123") == "abc 123"

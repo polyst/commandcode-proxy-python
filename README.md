@@ -157,6 +157,14 @@ prompt/completion/total token；`reason/text` 是 reasoning 与正文的拆分�
 `ttft` 是上游首个事件的到达时间；`events` 是上游事件总数；`finish` 是结束原因。
 流式时前缀是 `[chat stream]`，中途断流会显示 `HTTP stream-broken`。
 
+流式请求里如果上游报错，同一行末尾会追加 `ERROR` 段，例如：
+
+```text
+[chat stream] poolside/laguna-s-2.1-free -> poolside/laguna-s-2.1-free  HTTP 200
+       tokens=?  2.02s ttft=1.91s  events=2
+       ERROR HTTP 503 server_error: Service temporarily unavailable. Please try again shortly.
+```
+
 出错时打印客户端模型名、映射结果和耗时，例如：
 
 ```text
@@ -218,6 +226,21 @@ Accept: text/event-stream
 - 上游返回非 200 时：4xx 原样透传状态码，5xx 与连接失败一律转 `502`。
 - 错误体统一为 `{"error": {"message", "type", "param": null, "code": null}}`。
 
+### 上游错误透传
+
+上游会在事件流中间插入 `{"type":"error","error":{message, type, statusCode, isRetryable}}`
+（例如 `503 Service temporarily unavailable`）。这个错误**原样透传给客户端**，不吞掉：
+
+- 流式：作为一条 `data: {"error": {...}}` 的 SSE payload 发出，随后照旧 `data: [DONE]` 收尾。
+  信封里带上游自己的 `message`、`type`，并把 `statusCode` 放进 `error.status`。之前这里被静默
+  丢弃，客户端只收到一个 200 加空补全，agent 于是报"模型未返回内容"。
+- 非流式：返回上游自己的状态码（如 `503`、`403`），不再一律压成 `502`；上游没给状态码时才回 `502`。
+
+流式场景下响应头已经是 200，改不了状态行，所以只能靠这个 payload 把错误送到客户端手里——
+这也是它必须带 `error.status` 的原因。
+
+代理不支持自动重试：`isRetryable` 只是上游给客户端的建议，要不要重试、重试几次由客户端决定。
+
 消息转换有几处刻意保留的怪癖（它们是上游契约，不是风格问题）：
 
 - `tool` 结果文本以 `Error:` 开头时，`output.type` 用 `error-text`；
@@ -241,7 +264,7 @@ reasoning_tokens: 130, text_tokens: -10`），Go 版同样原样透传。
 ## 测试
 
 ```bash
-python -m pytest -q        # 219 passed
+python -m pytest -q        # 228 passed
 ```
 
 覆盖模型映射（含 Go 版 `model_test.go` 的全部用例）、消息与工具转换、流式/聚合事件转换、
@@ -254,6 +277,7 @@ python -m pytest -q        # 219 passed
 
 | 项 | Go 版 | 本实现 | 原因 |
 | --- | --- | --- | --- |
+| 上游流内错误 | 只记日志后继续，客户端拿到空补全 | 流式发 `data:{"error":...}`，非流式透传上游状态码 | 空补全在 agent 里表现为"模型未返回内容"，比上游自己的报错信息更没用的那种 |
 | 密钥优先级 | 请求头覆盖默认 key | 本地模式下默认 key 始终生效，请求头只校验 | Go 版会把客户端填的占位符 key 转发上游导致 401；agent 客户端强制填 key，这等于默认配置不可用 |
 | 图片输入 | 压成文本 `[Image URL: ...]` | 真正的 upstream image part | Go 版让视觉模型只看到 URL 字符串，看不到像素；本实现实测视觉模型能读出图内内容 |
 | reasoning 回传 | `thinking` 塌平成 `text` | 保留为 `{type:"reasoning"}` part | 这是上游读回 thinking 的方式，也才能让多轮 reasoning 续接 |
@@ -294,7 +318,7 @@ Chat Completions 请求，然后复用同一个 handler（见参考实现 `proxy
 │   ├── models.py      # 模型对照表: 文件加载、mtime 热重载、兜底默认值
 │   ├── responses.py   # 上游 NDJSON → SSE 流 / 聚合为单个 JSON
 │   └── upstream.py    # 信封构建、请求头、finish_reason、npm 版本缓存
-└── tests/              # 219 个用例，全部走 httpx.MockTransport，不联网
+└── tests/              # 228 个用例，全部走 httpx.MockTransport，不联网
 ```
 
 ## 已知边界
