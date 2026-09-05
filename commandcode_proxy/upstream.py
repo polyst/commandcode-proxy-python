@@ -27,6 +27,9 @@ UNKNOWN_VERSION = "unknown"
 
 DEFAULT_TEMPERATURE = 0.3
 DEFAULT_MAX_TOKENS = 64000
+# The upstream's hard validation cap on params.max_tokens, verified on three
+# unrelated models: 200000 is accepted, 200001 rejects with BAD_REQUEST.
+UPSTREAM_MAX_TOKENS = 200000
 UPSTREAM_TIMEOUT = 300.0
 VERSION_FETCH_TIMEOUT = 10.0
 
@@ -65,12 +68,23 @@ def _pick_temperature(request: dict[str, Any]) -> float:
 
 
 def _pick_max_tokens(request: dict[str, Any]) -> int:
-    """max_completion_tokens wins over max_tokens, mirroring the Go precedence."""
-    return _number(
+    """max_completion_tokens wins over max_tokens, mirroring the Go precedence.
+
+    Clamped to the upstream's hard validation cap. Clients derive max_tokens from
+    the model's advertised output limit, and ZCode's own catalog advertises
+    384000 for deepseek-v4-flash -- the upstream refuses anything above 200000,
+    so the request 400s before it ever reaches the model.
+    """
+    requested = _number(
         request.get("max_completion_tokens", request.get("max_tokens")),
         DEFAULT_MAX_TOKENS,
         int,
     )
+    if requested > UPSTREAM_MAX_TOKENS:
+        log.warning("clamped max_tokens %d -> %d (upstream validation cap)",
+                    requested, UPSTREAM_MAX_TOKENS)
+        return UPSTREAM_MAX_TOKENS
+    return requested
 
 
 def build_envelope(request: dict[str, Any], model: str) -> dict[str, Any]:

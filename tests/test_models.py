@@ -1,11 +1,15 @@
 """Model mapping tests.
 
-Every alias target here was extracted as a string literal from the
-command-code@1.49.0 CLI bundle, so none of them are guesses.
+Model ids must come from the command-code CLI bundle's canonicalId
+table, not from its flat display arrays: those also contain the
+provider-internal slugs, and tencent/hy3 (a slug) 403s upstream while
+the real id tencent/hy3-paid works. gpt-5.6-luna is canonical with no
+vendor segment; the upstream maps it to openai/gpt-5.6-luna itself.
 """
 
 import json
 import os
+from pathlib import Path
 import time
 
 import pytest
@@ -22,7 +26,7 @@ CASES = [
     # Tencent.
     ("hy4-preview", "tencent/hy4-preview"),
     ("hy4", "tencent/hy4-preview"),
-    ("hy3", "tencent/hy3"),
+    ("hy3", "tencent/hy3-paid"),
     # Moonshot - bare aliases point at the newest model of the family.
     ("kimi-k3", "moonshotai/Kimi-K3"),
     ("kimi3", "moonshotai/Kimi-K3"),
@@ -85,8 +89,10 @@ CASES = [
     ("nemotron-3-ultra", "nvidia/nemotron-3-ultra-550b-a55b"),
     ("nemotron", "nvidia/nemotron-3-ultra-550b-a55b"),
     # Premium closed-source models included on the Go plan.
-    ("gpt-5.6-luna", "openai/gpt-5.6-luna"),
-    ("gpt-luna", "openai/gpt-5.6-luna"),
+    ("gpt-luna", "gpt-5.6-luna"),
+    ("tencent/hy3", "tencent/hy3-paid"),
+    ("openai/gpt-5.6-luna", "gpt-5.6-luna"),
+    ("gpt-5.6", "gpt-5.6-luna"),
     ("muse-spark-1.3-contributor", "meta/muse-spark-1.3-contributor"),
     ("muse-1.3", "meta/muse-spark-1.3-contributor"),
     ("muse-spark-1.2-contributor", "meta/muse-spark-1.2-contributor"),
@@ -112,6 +118,20 @@ def test_alias_table(alias, expected):
     assert seed_table().map_model(alias) == expected
 
 
+def test_no_alias_points_at_a_missing_model():
+    """Every alias target must be a model the upstream actually recognises;
+    tencent/hy3 was an internal provider slug and 403d on every request."""
+    data = json.loads(Path("models.json").read_text(encoding="utf-8"))
+    ids = {m["id"] if isinstance(m, dict) else m for m in data["models"]}
+    dangling = {k: v for k, v in data["aliases"].items() if v not in ids}
+    assert not dangling, f"aliases with no matching model: {dangling}"
+
+
+def test_no_identity_aliases():
+    data = json.loads(Path("models.json").read_text(encoding="utf-8"))
+    assert not [k for k, v in data["aliases"].items() if k == v]
+
+
 def test_alias_lookup_is_case_insensitive():
     assert seed_table().map_model("MiniMax") == "MiniMaxAI/MiniMax-M3"
     assert seed_table().map_model("  KIMI-K2.6  ") == "moonshotai/Kimi-K2.6"
@@ -120,7 +140,7 @@ def test_alias_lookup_is_case_insensitive():
 def test_shipped_file_is_a_complete_go_plan_catalog():
     table = ModelRegistry().table
     assert len(table.model_list()) == 42
-    assert len(table.aliases) == 85
+    assert len(table.aliases) == 87
 
     models = table.model_list()
     ids = {model["id"] for model in models}

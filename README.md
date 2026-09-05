@@ -109,13 +109,18 @@ curl http://127.0.0.1:55990/v1/chat/completions \
 - `models` 供 `GET /v1/models` 使用。条目可以是字符串（`"deepseek/deepseek-v4-pro"`，`owned_by` 从 `/` 前的前缀推导）或对象（可显式指定 `owned_by`）。
 - `models` 省略时，从 `aliases` 的目标值去重推导（只保留含 `/` 的）。
 - 保存文件即生效，**不用重启**：每次请求会检查 mtime。
-- 文件缺失或 JSON 损坏时回退到代码内置的兜底表（`commandcode_proxy/models.py` 里的
-  `DEFAULT_ALIASES` / `DEFAULT_MODELS`），并打一条 warning。因此那个兜底表**不是**日常维护的地方。
+- 文件缺失或 JSON 损坏时回退到 `models.py` 里的 `seed_table()`，它从 `models.json` 自身
+  加载一次作为兜底，并打一条 warning。没有第二份手写的目录要同步维护。
 
-随附的 `models.json` 有 42 个模型 / 85 条别名，覆盖当前套餐页列出的全部模型。模型 ID 不是
-从展示名猜的，而是从 `command-code@1.49.0` 的 `dist/cli.mjs` 里把字符串字面量提取出来的，
-零猜测——包括容易被猜错的那个：套餐页显示 `GLM-5.3 Flash`，真实 ID 是
-`z-ai/glm-5.3-flash`（命名空间是 `z-ai`，不是 `zai-org`）。
+随附的 `models.json` 有 42 个模型 / 87 条别名，覆盖当前套餐页列出的全部模型。模型 ID 取自
+`command-code` CLI 包 `dist/cli.mjs` 里的 **`canonicalId` 表**，不是那个扁平的展示名数组——
+后者混着 provider 内部 slug。`tencent/hy3` 就是 slug，上游对每个请求回
+`403 Model/provider not recognized`；真实 ID 是 `tencent/hy3-paid`（`tencent/hy3` 保留为兼容
+别名，避免已保存的配置突然 403）。`gpt-5.6-luna` 本身是 canonical ID、没有 vendor 段，上游
+内部才映射成 `openai/gpt-5.6-luna`。CLI 里另有免费档 `tencent/Hy3`，但上游明确说该档已停服，
+所以没放进列表——把它别名到付费版会静默产生费用。
+另一个容易猜错的：套餐页显示 `GLM-5.3 Flash`，真实 ID 是 `z-ai/glm-5.3-flash`
+（命名空间是 `z-ai`，不是 `zai-org`）。
 
 注意 Go 版 `bin/` 里那个 `v1.0.8` 的二进制是**过期构建**：它只带 12 个模型，而 `proxy.go`
 源码里是 18 个。本实现跟着源码走，不要拿那个二进制当参照。
@@ -219,6 +224,11 @@ Accept: text/event-stream
 其它约定：
 
 - 默认 `temperature = 0.3`，`max_tokens = 64000`；`max_completion_tokens` 覆盖 `max_tokens`。
+- **`max_tokens` 上限 200000**：上游对 `params.max_tokens` 有硬校验，`200000` 通过、`200001`
+  直接 400 `Too big`（在 3 个互不相关的模型上验证一致）。超限值被压到 200000 并打一条 warning。
+  这个 clamp 不是可选项：客户端普遍按模型声明的输出上限来填这个字段，而 ZCode 自己的目录里
+  `deepseek-v4-flash` 声明的是 `384000`，不压的话请求在到达模型之前就被拒。`install_to_zcode.py`
+  写 provider 时也会把 output 上限一并压到 200000，别让它发出不可能成功的值。
 - `config.date` 取本地时区的 `YYYY-MM-DD`。
 - **上游永远按流式拉取**（`params.stream` 恒为 `true`）。非流式客户端的结果是把整条流读完再聚合，
   与 Go 版行为一致。
@@ -264,7 +274,7 @@ reasoning_tokens: 130, text_tokens: -10`），Go 版同样原样透传。
 ## 测试
 
 ```bash
-python -m pytest -q        # 228 passed
+python -m pytest -q        # 236 passed
 ```
 
 覆盖模型映射（含 Go 版 `model_test.go` 的全部用例）、消息与工具转换、流式/聚合事件转换、
@@ -282,7 +292,8 @@ python -m pytest -q        # 228 passed
 | 图片输入 | 压成文本 `[Image URL: ...]` | 真正的 upstream image part | Go 版让视觉模型只看到 URL 字符串，看不到像素；本实现实测视觉模型能读出图内内容 |
 | reasoning 回传 | `thinking` 塌平成 `text` | 保留为 `{type:"reasoning"}` part | 这是上游读回 thinking 的方式，也才能让多轮 reasoning 续接 |
 | reasoning 输出 | 不区分，全进 `content` | 单独进 `delta.reasoning` / `message.reasoning` | 上游 `reasoning-delta` 与 `text-delta` 是分开的两个事件 |
-| 模型目录 | 12（`bin` 二进制）/ 18（源码） | 42 模型 / 85 别名 | 从 `command-code` npm 包提取真实 ID，覆盖当前套餐 |
+| 模型目录 | 12（`bin` 二进制）/ 18（源码） | 42 模型 / 87 别名 | 从 CLI 的 `canonicalId` 表取，不是扁平展示数组——后者混着 provider slug，`tencent/hy3` 就是错的 |
+| `max_tokens` 上限 | 无校验 | 压到上游硬上限 200000 | 客户端按模型声明的输出上限填这个字段；ZCode 目录里 `deepseek-v4-flash` 是 384000，上游硬拒 >200000，不压等于这类请求必 400 |
 | `/v1/responses` | 有 | **无**（404） | 按需求只实现核心三件套；要补回见下 |
 | GitHub tag 版本自检 | 有 | 无 | 指向 Go 仓库，移植后无意义 |
 | `404` 响应体 | `text/plain` 的 `404 page not found` | OpenAI 错误信封 | OpenAI 客户端期望 JSON |
@@ -307,7 +318,7 @@ Chat Completions 请求，然后复用同一个 handler（见参考实现 `proxy
 .
 ├── start.bat           # Windows 一键启动: 建 venv、装依赖、起服务
 ├── AGENT_SETUP.md      # 把代理接入具体 AI agent 的配置片段与注意事项
-├── models.json         # 模型对照表 (42 模型 / 85 别名)，热重载
+├── models.json         # 模型对照表 (42 模型 / 87 别名)，热重载
 ├── .env.example        # 配置模板
 ├── pyproject.toml
 ├── commandcode_proxy/
@@ -318,7 +329,7 @@ Chat Completions 请求，然后复用同一个 handler（见参考实现 `proxy
 │   ├── models.py      # 模型对照表: 文件加载、mtime 热重载、兜底默认值
 │   ├── responses.py   # 上游 NDJSON → SSE 流 / 聚合为单个 JSON
 │   └── upstream.py    # 信封构建、请求头、finish_reason、npm 版本缓存
-└── tests/              # 228 个用例，全部走 httpx.MockTransport，不联网
+└── tests/              # 236 个用例，全部走 httpx.MockTransport，不联网
 ```
 
 ## 已知边界

@@ -1,6 +1,7 @@
 """Envelope construction, headers, and the x-command-code-version cache."""
 
 import asyncio
+import logging
 import re
 from datetime import date
 
@@ -9,6 +10,7 @@ import pytest
 
 from commandcode_proxy.upstream import (
     GENERATE_PATH,
+    UPSTREAM_MAX_TOKENS,
     NPM_LATEST_URL,
     UNKNOWN_VERSION,
     VersionCache,
@@ -81,6 +83,38 @@ def test_max_completion_tokens_wins_over_max_tokens():
         "max_completion_tokens": 999,
     }, "m")
     assert envelope["params"]["max_tokens"] == 999
+
+
+def test_max_tokens_above_the_upstream_cap_is_clamped(caplog):
+    """ZCode advertises 384000 output tokens for deepseek-v4-flash; the upstream
+    refuses anything above 200000 and rejects the request outright."""
+    with caplog.at_level(logging.WARNING, logger="commandcode_proxy.upstream"):
+        envelope = build_envelope({"messages": BASE_MESSAGES, "max_tokens": 384000}, "m")
+    assert envelope["params"]["max_tokens"] == 200000
+    assert any("clamped max_tokens 384000 -> 200000" in r.message for r in caplog.records)
+
+
+def test_max_tokens_at_the_cap_is_left_alone(caplog):
+    with caplog.at_level(logging.WARNING, logger="commandcode_proxy.upstream"):
+        envelope = build_envelope({"messages": BASE_MESSAGES, "max_tokens": 200000}, "m")
+    assert envelope["params"]["max_tokens"] == 200000
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_max_completion_tokens_is_clamped_too():
+    envelope = build_envelope({
+        "messages": BASE_MESSAGES,
+        "max_tokens": 100,
+        "max_completion_tokens": 1000000,
+    }, "m")
+    assert envelope["params"]["max_tokens"] == 200000
+
+
+def test_default_max_tokens_stays_under_the_cap():
+    """A future bump of the default must not regress into a guaranteed 400."""
+    envelope = build_envelope({"messages": BASE_MESSAGES}, "m")
+    assert envelope["params"]["max_tokens"] == 64000
+    assert 64000 <= UPSTREAM_MAX_TOKENS
 
 
 def test_envelope_threads_tools_and_system_messages():

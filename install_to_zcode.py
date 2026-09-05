@@ -37,6 +37,9 @@ PLACEHOLDER_KEY = "commandcode"
 # purpose: a limit that is too small only costs an earlier compaction.
 DEFAULT_CONTEXT = 262144
 DEFAULT_OUTPUT = 16384
+# Hard cap the upstream enforces on params.max_tokens (see
+# commandcode_proxy.upstream.UPSTREAM_MAX_TOKENS).
+UPSTREAM_MAX_OUTPUT = 200000
 
 CONFIG = Path.home() / ".zcode" / "v2" / "config.json"
 CATALOG = Path(r"C:\gongju\ZCode\resources\model-providers") / (
@@ -75,6 +78,9 @@ def build_entry(models_json: Path, base_url: str) -> dict:
     for entry in data["models"]:
         model_id = entry["id"] if isinstance(entry, dict) else entry
         context, output, inputs = lookup(catalog, model_id)
+        # The upstream rejects params.max_tokens above 200000, so an output limit
+        # ZCode cannot honour is worse than a smaller one.
+        output = min(output, UPSTREAM_MAX_OUTPUT)
         # Only the *-vision model in this catalog actually accepts images; the
         # upstream tells a text-only model it got no image. Keep any other
         # modalities the catalog records, such as Kimi's video input.
