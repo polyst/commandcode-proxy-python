@@ -302,3 +302,8 @@ Chat Completions 请求，然后复用同一个 handler（见参考实现 `proxy
 上游协议（`/alpha/generate` 的信封、请求头、事件类型）是按 Go 版 v1.0.8 原样照搬的。
 如果上游已经变了，报错时会体现在 `--debug` 的日志里；`--base-url` 和
 `--command-code-version` 可以先顶住最外层的两处。
+
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)。参考实现是 [dev2k6/command-code-proxy-server](https://github.com/dev2k6/command-code-proxy-server)（Go 版），
+本项目是独立的 Python 重写，不是其 fork。
