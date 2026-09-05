@@ -1,0 +1,8 @@
+* text=auto
+
+# Batch scripts must keep CRLF or they will not run on Windows
+*.bat text eol=crlf
+
+# Keep the shipped model table and config examples stable
+models.json text eol=lf
+.env.example text eol=lf
