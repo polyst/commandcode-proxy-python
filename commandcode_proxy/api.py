@@ -170,6 +170,12 @@ def create_app(
                      "owned_by": model["owned_by"]}
             if model.get("name"):
                 entry["name"] = model["name"]
+            if model.get("contextWindow") is not None:
+                # Additive and optional: clients that track context size (DSH's
+                # auto-compaction, ZCode's catalog) read it, everyone else
+                # ignores an unknown field. Omitted when the vendor publishes no
+                # number, so a client keeps its own default instead of a guess.
+                entry["contextWindow"] = model["contextWindow"]
             data.append(entry)
         return {"object": "list", "data": data}
 

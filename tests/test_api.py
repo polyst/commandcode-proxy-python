@@ -61,15 +61,58 @@ def test_models_endpoint_serves_the_mapped_catalog(make_app):
     body = response.json()
     assert response.status_code == 200
     assert body["object"] == "list"
-    assert len(body["data"]) == 42
+    assert len(body["data"]) == 50
     for entry in body["data"]:
-        assert set(entry) == {"id", "object", "created", "owned_by", "name"}
+        keys = {"id", "object", "created", "owned_by", "name"}
+        if "contextWindow" in entry:
+            keys.add("contextWindow")
+        assert set(entry) == keys
         assert entry["object"] == "model"
         assert entry["created"] == 0
         assert entry["name"]
     assert any(entry["id"] == "deepseek/deepseek-v4-pro" and entry["owned_by"] == "deepseek"
                and entry["name"] == "DeepSeek V4 Pro (latest)"
+               and entry["contextWindow"] == 1048576
                for entry in body["data"])
+
+
+def test_models_endpoint_passes_context_window_through_and_omits_the_unknown(make_app):
+    """contextWindow is advertised when the vendor publishes one.
+
+    The four models whose commandcode.ai page shows no number get no key at
+    all - not a fallback, not a guess - so a client keeps its own default
+    instead of compacting against a made-up window.
+    """
+    client, _ = make_app(lambda request: httpx.Response(200), config=Config())
+    with client:
+        body = client.get("/v1/models").json()
+
+    by_id = {entry["id"]: entry for entry in body["data"]}
+
+    assert by_id["deepseek/deepseek-v4-pro"]["contextWindow"] == 1048576
+    assert by_id["deepseek/deepseek-v4.1-flash"]["contextWindow"] == 1048576
+    assert by_id["inclusionai/ling-3.0-flash-sante:free"]["contextWindow"] == 262144
+    assert by_id["gpt-5.6-luna"]["contextWindow"] == 1153434
+    assert by_id["xai/grok-4.5"]["contextWindow"] == 512000
+    assert by_id["zai-org/GLM-5"]["contextWindow"] == 204800
+
+    # The seven models added when the Go plan grew from 44 to 50.
+    assert by_id["meituan/LongCat-2.0"]["contextWindow"] == 1048576
+    assert by_id["Qwen/Qwen3.8-Omni-Flash"]["contextWindow"] == 1048576
+    assert by_id["stepfun/Step-5-Preview"]["contextWindow"] == 1048576
+    assert by_id["xiaomi/mimo-v2.6-pro"]["contextWindow"] == 1048576
+    assert by_id["xiaomi/mimo-v2.6-flash"]["contextWindow"] == 1048576
+    assert by_id["z-ai/glm-5.3-flashx"]["contextWindow"] == 1048576
+    # CLI context table: ["gpt-6-luna",105e4]; the pricing page rounds it to 1.1M.
+    assert by_id["gpt-6-luna"]["contextWindow"] == 1050000
+
+    # meituan/LongCat-2.0:free is retired upstream (403), so it must not be
+    # advertised: a client would pick it from the selector and 403 on use.
+    assert "meituan/LongCat-2.0:free" not in by_id
+
+    for missing in ("zai-org/GLM-5.1", "MiniMaxAI/MiniMax-M2.7",
+                    "Qwen/Qwen3.6-Max-Preview", "Qwen/Qwen3.6-Plus"):
+        assert "contextWindow" not in by_id[missing]
 
 
 def test_chat_non_stream_builds_the_upstream_envelope(make_app):

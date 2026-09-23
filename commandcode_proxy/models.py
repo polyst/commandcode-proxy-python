@@ -17,13 +17,18 @@ File format::
       "aliases": { "short-name": "Vendor/Model-Id" },
       "models": [
         "Vendor/Model-Id",
-        { "id": "zai-org/GLM-5.1", "owned_by": "zhipuai", "name": "GLM-5.1" }
+        { "id": "zai-org/GLM-5.1", "owned_by": "zhipuai", "name": "GLM-5.1",
+          "contextWindow": 262144 }
       ]
     }
 
 ``owned_by`` is optional (derived from the id prefix when omitted) and ``name``
-is an optional display name. ``models`` may be left out entirely, in which case
-the list is derived from the alias targets.
+is an optional display name. ``contextWindow`` is an optional input-window token
+count, passed straight through to ``GET /v1/models`` so a client that tracks
+context size (DSH, ZCode) can decide when to compact instead of guessing. Leave
+it out for a model whose vendor page shows no number: the client then falls back
+to its own default, which is safer than a wrong value. ``models`` may be left
+out entirely, in which case the list is derived from the alias targets.
 
 There is deliberately no second copy of the catalog in this module: the
 fallback is seeded from ``models.json`` at import time, so the two cannot drift
@@ -57,15 +62,30 @@ class ModelTable:
     """An immutable snapshot of the alias table and the model list."""
 
     aliases: dict[str, str] = field(default_factory=dict)
-    models: list[dict[str, str]] = field(default_factory=list)
+    models: list[dict[str, object]] = field(default_factory=list)
 
     def map_model(self, name: str) -> str:
         if not name:
             return name
         return self.aliases.get(name.strip().lower(), name)
 
-    def model_list(self) -> list[dict[str, str]]:
+    def model_list(self) -> list[dict[str, object]]:
         return list(self.models)
+
+
+def _context_window(value: object, model_id: str) -> int | None:
+    """Validate the optional contextWindow field of a model entry.
+
+    Must be a positive token count. ``bool`` is rejected explicitly, because
+    ``True`` would otherwise pass ``isinstance(_, int)`` and become a 1-token
+    window. ``None`` means the field was absent, which is a valid state.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(
+            f"model {model_id!r} contextWindow must be a positive integer, got {value!r}")
+    return value
 
 
 def build_table(data: dict[str, Any]) -> ModelTable:
@@ -84,7 +104,7 @@ def build_table(data: dict[str, Any]) -> ModelTable:
         raise ValueError("'aliases' is empty")
 
     models_raw = data.get("models")
-    models: list[dict[str, str]]
+    models: list[dict[str, object]]
     if models_raw is None:
         models = []
         for target in sorted({value for value in aliases.values() if "/" in value}):
@@ -93,14 +113,20 @@ def build_table(data: dict[str, Any]) -> ModelTable:
         models = []
         for entry in models_raw:
             if isinstance(entry, str):
-                model_id, owner, name = entry, owned_by_of(entry), ""
+                model_id, owner, name, context_window = entry, owned_by_of(entry), "", None
             elif isinstance(entry, dict) and isinstance(entry.get("id"), str):
                 model_id = entry["id"]
                 owner = entry.get("owned_by") or owned_by_of(model_id)
                 name = entry.get("name") if isinstance(entry.get("name"), str) else ""
+                context_window = _context_window(entry.get("contextWindow"), model_id)
             else:
                 raise ValueError(f"invalid model entry: {entry!r}")
-            models.append({"id": model_id, "owned_by": owner, "name": name})
+            row: dict[str, object] = {"id": model_id, "owned_by": owner, "name": name}
+            if context_window is not None:
+                # Omitted when unknown, so a client keeps its own default rather
+                # than compacting against a number the vendor never published.
+                row["contextWindow"] = context_window
+            models.append(row)
     else:
         raise ValueError("'models' must be a list")
 

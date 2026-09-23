@@ -63,7 +63,7 @@ python install_to_zcode.py --base-url http://127.0.0.1:8080/v1   # 改端口
 ```
 
 注册一个 `CommandCode (local proxy)` 自定义 provider（`kind: openai-compatible`），
-带上全部 42 个模型。流程：**先跑 `start.bat` 起代理 → 再重启 ZCode → 模型选择器里选
+带上全部 44 个模型。流程：**先跑 `start.bat` 起代理 → 再重启 ZCode → 模型选择器里选
 `commandcode/<model-id>`**，例如 `commandcode/deepseek/deepseek-v4-flash`。
 
 provider 的 key 是 `commandcode`，而模型 ID 本身带 `/`，所以完整写法是两段 `/`。
@@ -188,7 +188,7 @@ agent 类工具通常默认设一个较小的 `max_tokens`，就会稳定拿到�
 
 ## 挑模型
 
-42 个模型 / 85 条别名，完整清单在 `models.json`，或：
+44 个模型 / 92 条别名，完整清单在 `models.json`，或：
 
 ```bash
 curl http://127.0.0.1:55990/v1/models

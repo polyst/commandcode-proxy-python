@@ -21,8 +21,21 @@ CASES = [
     ("laguna-s-2.1-free", "poolside/laguna-s-2.1-free"),
     ("laguna-s-2.1", "poolside/laguna-s-2.1-free"),
     ("LAGUNA", "poolside/laguna-s-2.1-free"),
-    ("longcat-2.0", "meituan/LongCat-2.0:free"),
-    ("longcat", "meituan/LongCat-2.0:free"),
+    ("longcat-2.0", "meituan/LongCat-2.0"),
+    ("longcat", "meituan/LongCat-2.0"),
+    ("qwen-3.8-omni-flash", "Qwen/Qwen3.8-Omni-Flash"),
+    ("qwen-omni", "Qwen/Qwen3.8-Omni-Flash"),
+    ("step-5-preview", "stepfun/Step-5-Preview"),
+    ("step-5", "stepfun/Step-5-Preview"),
+    ("mimo-v2.6-pro", "xiaomi/mimo-v2.6-pro"),
+    ("mimo-v2.6", "xiaomi/mimo-v2.6-pro"),
+    ("mimo-v2.6-flash", "xiaomi/mimo-v2.6-flash"),
+    ("glm-5.3-flashx", "z-ai/glm-5.3-flashx"),
+    ("glm-flashx", "z-ai/glm-5.3-flashx"),
+    ("gpt6-luna", "gpt-6-luna"),
+    # InclusionAI free-tier deal.
+    ("ling-3.0-flash-sante", "inclusionai/ling-3.0-flash-sante:free"),
+    ("ling-sante", "inclusionai/ling-3.0-flash-sante:free"),
     # Tencent.
     ("hy4-preview", "tencent/hy4-preview"),
     ("hy4", "tencent/hy4-preview"),
@@ -59,6 +72,9 @@ CASES = [
     ("deepseek-flash", "deepseek/deepseek-v4-flash"),
     ("deepseek-v4-flash-vision", "deepseek/deepseek-v4-flash-vision-exp"),
     ("deepseek-v4-flash-fast", "deepseek/deepseek-v4-flash-fast"),
+    ("deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash"),
+    ("deepseek-v4.1", "deepseek/deepseek-v4.1-flash"),
+    ("ds-v4.1", "deepseek/deepseek-v4.1-flash"),
     # Qwen.
     ("qwen-3.8-max-0902", "Qwen/Qwen3.8-Max-0902"),
     ("qwen-3.8-max", "Qwen/Qwen3.8-Max"),
@@ -139,15 +155,23 @@ def test_alias_lookup_is_case_insensitive():
 
 def test_shipped_file_is_a_complete_go_plan_catalog():
     table = ModelRegistry().table
-    assert len(table.model_list()) == 42
-    assert len(table.aliases) == 87
+    assert len(table.model_list()) == 50
+    assert len(table.aliases) == 103
 
     models = table.model_list()
     ids = {model["id"] for model in models}
-    assert len(ids) == 42
+    assert len(ids) == 50
     for model in models:
-        assert set(model) == {"id", "owned_by", "name"}
+        # contextWindow is optional: present for every model whose vendor page
+        # publishes one, absent for the four whose page shows no number.
+        keys = {"id", "owned_by", "name"}
+        if "contextWindow" in model:
+            keys.add("contextWindow")
+            assert isinstance(model["contextWindow"], int) and model["contextWindow"] > 0
+        assert set(model) == keys
         assert model["id"] and model["owned_by"] and model["name"]
+    # Exactly the four models with no published window are left without one.
+    assert sum("contextWindow" in model for model in models) == 46
     # Every alias must point at a model in the catalog.
     assert set(table.aliases.values()) <= ids
     # Every model must be reachable by at least one alias.
@@ -180,10 +204,63 @@ def test_string_model_entries_get_a_derived_owner():
     assert table.models == [{"id": "zai-org/GLM-5", "owned_by": "zai-org", "name": ""}]
 
 
+def test_string_model_entries_cannot_carry_a_context_window():
+    """Only the dict form supports per-model limits, so the fallback path does
+    not silently claim a window it has no way to know."""
+    table = build_table({"aliases": {"a": "V/One", "b": "V/Two"}})
+    assert all("contextWindow" not in model for model in table.models)
+
+
+def test_context_window_passes_through_and_is_omitted_when_absent():
+    table = build_table({"aliases": {"one": "V/One", "two": "V/Two"},
+                         "models": [{"id": "V/One", "owned_by": "v", "name": "One",
+                                     "contextWindow": 1048576},
+                                    {"id": "V/Two", "owned_by": "v", "name": "Two"}]})
+    by_id = {model["id"]: model for model in table.model_list()}
+    assert by_id["V/One"]["contextWindow"] == 1048576
+    assert set(by_id["V/One"]) == {"id", "owned_by", "name", "contextWindow"}
+    assert set(by_id["V/Two"]) == {"id", "owned_by", "name"}
+
+
+@pytest.mark.parametrize("bad", [0, -1, 2.5, "262144", True, []])
+def test_build_table_rejects_an_invalid_context_window(bad):
+    """A wrong window would make a client compact early or overflow the model,
+    so it fails the whole load rather than shipping silently."""
+    with pytest.raises(ValueError, match="contextWindow"):
+        build_table({"aliases": {"a": "V/One"},
+                     "models": [{"id": "V/One", "contextWindow": bad}]})
+
+
+def test_invalid_context_window_keeps_the_previous_table(tmp_path):
+    """Same fail-closed rule as the rest of the loader: a bad edit must not
+    empty the catalog out from under running clients."""
+    path = tmp_path / "models.json"
+    good = {"aliases": {"a": "V/One"},
+            "models": [{"id": "V/One", "owned_by": "v", "name": "One",
+                        "contextWindow": 1048576}]}
+    path.write_text(json.dumps(good), encoding="utf-8")
+    registry = ModelRegistry(path)
+    before = registry.table
+
+    bad = json.loads(path.read_text(encoding="utf-8"))
+    bad["models"][0]["contextWindow"] = "not-a-number"
+    path.write_text(json.dumps(bad), encoding="utf-8")
+    # An unchanged mtime is a no-op; nudge it forward to simulate a real save.
+    future = time.time() + 60
+    os.utime(path, (future, future))
+
+    assert registry.reload_if_changed() is before
+    assert registry.last_error
+
+    path.write_text(json.dumps(good), encoding="utf-8")
+    os.utime(path, (future + 1, future + 1))
+    assert registry.reload_if_changed() is not before
+
+
 def test_missing_file_falls_back_to_the_seeded_table(tmp_path):
     table = ModelRegistry(tmp_path / "nope.json").table
     assert table.map_model("minimax") == "MiniMaxAI/MiniMax-M3"
-    assert len(table.model_list()) == 42
+    assert len(table.model_list()) == 50
 
 
 def test_broken_file_falls_back_to_the_seeded_table(tmp_path):

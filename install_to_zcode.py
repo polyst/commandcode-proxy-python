@@ -42,17 +42,29 @@ DEFAULT_OUTPUT = 16384
 UPSTREAM_MAX_OUTPUT = 200000
 
 CONFIG = Path.home() / ".zcode" / "v2" / "config.json"
-CATALOG = Path(r"C:\gongju\ZCode\resources\model-providers") / (
-    "models_catalog_china_llm_zcode_2026-06-03.json"
-)
+# ZCode used to ship a date-stamped catalog JSON here. That filename changes on
+# every update, and the file is gone in the 2026-09 rebuild (app.asar now only
+# carries the Zod schemas zcode.model-providers.v1/v2), so it is globbed rather
+# than hard-coded. With no catalog, models.json's vendor-published contextWindow
+# still wins and only the output limit falls back to the conservative default.
+CATALOG_DIR = Path(r"C:\gongju\ZCode\resources\model-providers")
+
+
+def find_catalog() -> Path | None:
+    """Newest ZCode catalog file, or None when ZCode ships none at all."""
+    if not CATALOG_DIR.is_dir():
+        return None
+    matches = sorted(CATALOG_DIR.glob("models_catalog*.json"))
+    return matches[-1] if matches else None
 
 
 def catalog_limits() -> dict[str, tuple[int, int, list[str]]]:
     """Map bare model id -> (context, output, input modalities) from ZCode's catalog."""
-    if not CATALOG.is_file():
+    catalog_path = find_catalog()
+    if catalog_path is None:
         return {}
     table: dict[str, tuple[int, int, list[str]]] = {}
-    catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
     for provider in catalog.get("providers", []):
         for model in provider.get("models", []):
             context = model.get("contextWindow") or DEFAULT_CONTEXT
@@ -78,6 +90,12 @@ def build_entry(models_json: Path, base_url: str) -> dict:
     for entry in data["models"]:
         model_id = entry["id"] if isinstance(entry, dict) else entry
         context, output, inputs = lookup(catalog, model_id)
+        # A contextWindow in models.json is vendor-published and beats both the
+        # ZCode catalog guess and DEFAULT_CONTEXT. Without it, gpt-6-luna would
+        # get 262144 while the upstream actually gives it 1050000.
+        published = entry.get("contextWindow") if isinstance(entry, dict) else None
+        if isinstance(published, int) and published > 0:
+            context = published
         # The upstream rejects params.max_tokens above 200000, so an output limit
         # ZCode cannot honour is worse than a smaller one.
         output = min(output, UPSTREAM_MAX_OUTPUT)
@@ -113,6 +131,9 @@ def main() -> int:
 
     entry = build_entry(Path(args.models_file), args.base_url)
     print(f"provider: {PROVIDER_ID}  models: {len(entry['models'])}  base_url: {args.base_url}")
+    if find_catalog() is None:
+        print(f"note: no ZCode model catalog under {CATALOG_DIR}; contextWindow comes "
+              "from models.json, the output limit falls back to the conservative default")
     if args.dry_run:
         print(json.dumps(entry, indent=2, ensure_ascii=False)[:2000])
         return 0
