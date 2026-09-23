@@ -93,7 +93,8 @@ def test_models_endpoint_passes_context_window_through_and_omits_the_unknown(mak
     assert by_id["deepseek/deepseek-v4.1-flash"]["contextWindow"] == 1048576
     assert by_id["inclusionai/ling-3.0-flash-sante:free"]["contextWindow"] == 262144
     assert by_id["gpt-5.6-luna"]["contextWindow"] == 1153434
-    assert by_id["xai/grok-4.5"]["contextWindow"] == 512000
+    # 500K on the plan page and 5e5 in the CLI registry; 512000 was a misread.
+    assert by_id["xai/grok-4.5"]["contextWindow"] == 500000
     assert by_id["zai-org/GLM-5"]["contextWindow"] == 204800
 
     # The seven models added when the Go plan grew from 44 to 50.

@@ -20,7 +20,9 @@ OpenAI 客户端
 
 ## 快速开始
 
-Windows 上双击 `start.bat` 即可——首次运行会自动建 `.venv` 并装依赖，之后秒开。
+Windows 上双击 `sync-and-run.bat` 即可——它先从 `models.json` 刷新 ZCode 的 provider 配置
+（内容没变就跳过，不写备份），再起服务；首次运行会自动建 `.venv` 并装依赖。只想起服务用
+`start.bat`。
 参数会原样透传给服务：
 
 ```bat
@@ -98,7 +100,8 @@ curl http://127.0.0.1:55990/v1/chat/completions \
   },
   "models": [
     { "id": "deepseek/deepseek-v4-pro", "owned_by": "deepseek",
-      "name": "DeepSeek V4 Pro (latest)", "contextWindow": 1048576 }
+      "name": "DeepSeek V4 Pro (latest)", "contextWindow": 1048576,
+      "reasoning": true, "efforts": ["high", "max"], "inputs": ["text"] }
   ]
 }
 ```
@@ -107,8 +110,13 @@ curl http://127.0.0.1:55990/v1/chat/completions \
 
 - `aliases` 是**完整替换**，不是合并。文件里没写的旧别名会失效。
 - 匹配大小写不敏感，前后空格会被去掉；未命中的名字**原样透传**给上游。所以上游新增模型时通常什么都不用改，只有想要短别名才需要加一行。
-- `models` 供 `GET /v1/models` 使用。条目可以是字符串（`"deepseek/deepseek-v4-pro"`，`owned_by` 从 `/` 前的前缀推导）或对象（可显式指定 `owned_by`、`name`、`contextWindow`）。
+- `models` 供 `GET /v1/models` 使用。条目可以是字符串（`"deepseek/deepseek-v4-pro"`，`owned_by` 从 `/` 前的前缀推导）或对象（可显式指定 `owned_by`、`name`、`contextWindow`、`reasoning`、`efforts`、`inputs`）。
 - `contextWindow` 可选：该模型的输入上下文 token 数。`GET /v1/models` 会原样带上它，DSH 的「获取可用模型」读这个字段来做自动压缩，ZCode 的目录同理；不认识它的客户端会忽略。数值是 1024 进制——`256K` 和 `262K` 都是 `262144`，`1M` 是 `1048576`——取自 commandcode.ai 各模型页面。厂商页面没给数字的模型**故意留空**：客户端退回自己的默认值，比写一个错的更稳。该字段必须是正整数，写错会让整个文件加载失败并保留上一版目录，不会清空模型列表。
+- `reasoning`（布尔）、`efforts`（级别名列表）、`inputs`（模态列表）取自 `command-code` CLI
+  包的模型注册表（`dist/cli.mjs` 里那张 85 个模型的表，每条都带 `reasoning:!0` 与
+  `reasoningEfforts`）。`GET /v1/models` 不透传这三个字段，`install_to_zcode.py` 读它们来
+  决定写不写 `reasoning` 块、级别列表是什么、以及该模型能不能收图。写错类型只会让
+  `install_to_zcode.py` 忽略该字段并退回默认值。
 - `models` 省略时，从 `aliases` 的目标值去重推导（只保留含 `/` 的）。
 - 保存文件即生效，**不用重启**：每次请求会检查 mtime。
 - 文件缺失或 JSON 损坏时回退到 `models.py` 里的 `seed_table()`，它从 `models.json` 自身
@@ -145,9 +153,13 @@ ID 取自 commandcode.ai 模型页面打印的 `cmd --model <id>` 参数，不�
 条目，`models.json` 一改完就重跑一次（幂等，写入前按时间戳备份）：
 
 ```bash
-python install_to_zcode.py            # 写入
-python install_to_zcode.py --dry-run  # 只打印
+python install_to_zcode.py                 # 写入
+python install_to_zcode.py --dry-run       # 只打印
+python install_to_zcode.py --if-changed    # 内容没变就不写、不备份
 ```
+
+`--if-changed` 是 `sync-and-run.bat` 用的：它比对着算出来的条目和 config.json 里现有的
+做全等比较，一样就什么都不写，这样每天起一次服务不会留下几十个时间戳备份。
 
 每个模型条目带四样东西：
 
@@ -162,12 +174,21 @@ python install_to_zcode.py --dry-run  # 只打印
   都不认也不会报错。`app.asar` 里的 Zod schema 判不出该用哪一个——config.json 的模型
   条目形状（含 `zcode.modalitiesConfigured`）在整个 bundle 里 0 次命中，说明它不走那套
   schema 校验。
-- `reasoning`：每个模型都写 `{"enabled": true, "variants": ["off","high","max"],
-  "defaultVariant": "max"}`，形状与 ZCode 自己在 config.json 里为同一厂商存的一致。
-  **这个开关是摆设**：`/alpha/generate` 的 `params` 只有 `model, messages, tools,
-  system, max_tokens, temperature, stream` 七个字段，没有 reasoning-effort 旋钮，
-  客户端发的 effort 会被信封构建器静默丢弃。仍然写它，是因为套餐里几乎所有模型都是
-  推理模型（`inkling-small` 也算），不写的话 ZCode 会按非推理模型对待。
+- `modalities.input`：直接取自 `models.json` 的 `inputs`（CLI 注册表的
+  `inputModalities`）。不再用「id 里有没有 `vision` 这个词」猜——那套猜法把 29 个能收图的
+  模型全判成纯文本。CLI 说有 30/50 是多模态，其中 `moonshotai/Kimi-K3` 与 ZCode 自己
+  目录里的 `kimi-k3` 一致，两个独立来源对得上。注意这与早前「只有
+  `deepseek-v4-flash-vision-exp` 能读图」的实测结论冲突：那次只测了少数几个模型，
+  现在按 CLI 的声明放开，代价是某个标了图但其实不收图的模型会回答「我看不到图片」——
+  是提示不是报错。
+- `reasoning`：**只有** `models.json` 标 `"reasoning": true` 的 39 个模型写；11 个 CLI 明确
+  标 `false` 的（全部 `xiaomi/mimo-*`、`MiniMax M2.5/M2.7`、`GLM-5`/`GLM-5.1`/`GLM-5.2-Fast`、
+  `Kimi K2.5/K2.6`）不写。`variants` 取该模型的 `efforts`（CLI 的 `reasoningEfforts`），
+  没有级别表的用 `low/high/max`，`defaultVariant` 取列表最高档。形状与 ZCode 自己在
+  config.json 里为同一厂商存的一致。**这个开关是摆设**：`/alpha/generate` 的 `params`
+  只有 `model, messages, tools, system, max_tokens, temperature, stream` 七个字段，没有
+  reasoning-effort 旋钮，客户端发的 effort 会被信封构建器静默丢弃。仍然写它，是因为不写
+  的话 ZCode 会按非推理模型对待这些模型。
 
 改完 config.json 要重启 ZCode 才生效。建议关闭 ZCode 之后再跑这个脚本：ZCode 可能在
 内存里持有这份文件并在退出时重写，跑着它改有被覆盖的风险（时间戳备份在）。
@@ -365,6 +386,7 @@ Chat Completions 请求，然后复用同一个 handler（见参考实现 `proxy
 ```text
 .
 ├── start.bat           # Windows 一键启动: 建 venv、装依赖、起服务
+├── sync-and-run.bat    # 先刷新 ZCode 配置（未变则跳过）再起服务
 ├── AGENT_SETUP.md      # 把代理接入具体 AI agent 的配置片段与注意事项
 ├── models.json         # 模型对照表 (50 模型 / 103 别名)，热重载
 ├── .env.example        # 配置模板

@@ -23,11 +23,12 @@ and a reasoning switch:
 - Name comes from models.json's name and is written twice: per model (`name`)
   and provider-wide (`modelDisplayNames`). Both are additive keys a strict
   reader drops, so whichever ZCode honours is the one that ends up showing.
-- Reasoning is written for every model because every model on the plan is a
-  reasoning model (inkling-small included, despite its name). It is
-  intentionally cosmetic: /alpha/generate has no reasoning-effort knob, so the
-  switch cannot affect anything upstream. It is present so ZCode shows the
-  model at all rather than hiding it behind a reasoning gate.
+- Reasoning is written only for models models.json marks as reasoning, and the
+  level list comes from its efforts field (the command-code CLI's own
+  per-model reasoningEfforts). It is intentionally cosmetic: /alpha/generate
+  has no reasoning-effort knob, so the switch cannot affect anything upstream.
+  It is present so ZCode shows the model as reasoning rather than treating it
+  as a plain model.
 
 Usage:
     python install_to_zcode.py              # write to ~/.zcode/v2/config.json
@@ -76,9 +77,9 @@ OUTPUT_OVERRIDES = {
     "moonshotai/Kimi-K3": 131072,
 }
 
-# Written verbatim into every model entry. Shape matches what ZCode already
-# persists for the same vendor elsewhere in config.json.
-REASONING = {"enabled": True, "variants": ["off", "high", "max"], "defaultVariant": "max"}
+# Fallback level list for a model models.json marks reasoning without giving
+# levels. The CLI's per-model reasoningEfforts wins when present.
+DEFAULT_EFFORTS = ["low", "high", "max"]
 
 CONFIG = Path.home() / ".zcode" / "v2" / "config.json"
 # ZCode used to ship a date-stamped catalog JSON here. That filename changes on
@@ -144,14 +145,29 @@ def build_entry(models_json: Path, base_url: str) -> dict:
         # Only the *-vision model in this catalog actually accepts images; the
         # upstream tells a text-only model it got no image. Keep any other
         # modalities the catalog records, such as Kimi's video input.
-        extras = [i for i in inputs if i not in ("text", "image")]
-        inputs = ["text"] + (["image"] if "vision" in model_id.lower() else []) + extras
+        published_inputs = entry.get("inputs") if isinstance(entry, dict) else None
+        if isinstance(published_inputs, list) and all(
+                isinstance(i, str) for i in published_inputs):
+            # models.json records the command-code CLI's own inputModalities, so
+            # this replaces the old "is 'vision' in the id" guess - which missed
+            # every multimodal model whose name omits the word.
+            extras = [i for i in published_inputs if i not in ("text", "image")]
+            inputs = ["text"] + (["image"] if "image" in published_inputs else []) + extras
+        else:
+            extras = [i for i in inputs if i not in ("text", "image")]
+            inputs = ["text"] + extras
+        reasoning = None
+        if entry.get("reasoning"):
+            efforts = entry.get("efforts") or DEFAULT_EFFORTS
+            reasoning = {"enabled": True, "variants": list(efforts),
+                         "defaultVariant": list(efforts)[-1]}
         model = {
             "limit": {"context": context, "output": output},
             "modalities": {"input": inputs, "output": ["text"]},
-            "reasoning": dict(REASONING),
             "zcode": {"modalitiesConfigured": True},
         }
+        if reasoning is not None:
+            model["reasoning"] = reasoning
         if isinstance(label, str) and label:
             model["name"] = label
             display_names[model_id] = label
@@ -175,11 +191,14 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Print the entry instead of writing")
     parser.add_argument("--base-url", default=BASE_URL)
     parser.add_argument("--models-file", default=str(Path(__file__).with_name("models.json")))
+    parser.add_argument("--if-changed", action="store_true",
+                        help="Skip the write (and the backup) when the config already holds this entry")
     args = parser.parse_args()
 
     entry = build_entry(Path(args.models_file), args.base_url)
     print(f"provider: {PROVIDER_ID}  models: {len(entry['models'])}  base_url: {args.base_url}")
     print(f"named: {len(entry['modelDisplayNames'])}  "
+          f"reasoning: {sum(1 for m in entry['models'].values() if 'reasoning' in m)}  "
           f"output overrides: {len(OUTPUT_OVERRIDES)}  "
           f"upstream cap: {UPSTREAM_MAX_OUTPUT}")
     if find_catalog() is None:
@@ -193,11 +212,15 @@ def main() -> int:
         print(f"error: {CONFIG} not found - is ZCode installed?", file=sys.stderr)
         return 1
 
+    config = json.loads(CONFIG.read_text(encoding="utf-8"))
+    if args.if_changed and config.get("provider", {}).get(PROVIDER_ID) == entry:
+        print("config already holds this entry - nothing written")
+        return 0
+
     backup = CONFIG.with_name(f"{CONFIG.name}.bak-{datetime.now():%Y%m%d-%H%M%S}")
     shutil.copy2(CONFIG, backup)
     print(f"backed up {CONFIG.name} -> {backup.name}")
 
-    config = json.loads(CONFIG.read_text(encoding="utf-8"))
     providers = config.setdefault("provider", {})
     replaced = PROVIDER_ID in providers
     providers[PROVIDER_ID] = entry
