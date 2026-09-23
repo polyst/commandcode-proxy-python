@@ -139,6 +139,38 @@ ID 取自 commandcode.ai 模型页面打印的 `cmd --model <id>` 参数，不�
 `models.py` 里的兜底表不再是手写副本，而是从 `models.json` 自举：文件损坏时用它自身加载到的
 内容回退，不会和 `models.json` 分叉成两份要同步维护的目录。
 
+### 写入 ZCode
+
+`install_to_zcode.py` 把这份目录写进 `~/.zcode/v2/config.json` 的 `provider.commandcode`
+条目，`models.json` 一改完就重跑一次（幂等，写入前按时间戳备份）：
+
+```bash
+python install_to_zcode.py            # 写入
+python install_to_zcode.py --dry-run  # 只打印
+```
+
+每个模型条目带四样东西：
+
+- `limit.context`：优先用 `models.json` 的 `contextWindow`（厂商真值），否则 `262144`。
+  它决定 ZCode 什么时候压缩对话。
+- `limit.output`：`OUTPUT_OVERRIDES` → ZCode 自带目录 → `65536`，最后统一压到 200000
+  （上游硬上限）。默认值不取更小的 16384：推理模型会先把 `max_tokens` 花在 reasoning
+  上，预算太小会得到 `finish_reason: length` 加一个空的 `content`。deepseek-v4 家族
+  的 `384000` 是模型真实上限，落盘时统一 clamp 到 200000。
+- `name` 与 provider 级 `modelDisplayNames`：都取自 `models.json` 的 `name`，两处都写。
+  两个字段都是加法性的，严格解析器会丢未知键，所以 ZCode 认哪一个就显示哪一个，两个
+  都不认也不会报错。`app.asar` 里的 Zod schema 判不出该用哪一个——config.json 的模型
+  条目形状（含 `zcode.modalitiesConfigured`）在整个 bundle 里 0 次命中，说明它不走那套
+  schema 校验。
+- `reasoning`：每个模型都写 `{"enabled": true, "variants": ["off","high","max"],
+  "defaultVariant": "max"}`，形状与 ZCode 自己在 config.json 里为同一厂商存的一致。
+  **这个开关是摆设**：`/alpha/generate` 的 `params` 只有 `model, messages, tools,
+  system, max_tokens, temperature, stream` 七个字段，没有 reasoning-effort 旋钮，
+  客户端发的 effort 会被信封构建器静默丢弃。仍然写它，是因为套餐里几乎所有模型都是
+  推理模型（`inkling-small` 也算），不写的话 ZCode 会按非推理模型对待。
+
+改完 config.json 要重启 ZCode 才生效。建议关闭 ZCode 之后再跑这个脚本：ZCode 可能在
+内存里持有这份文件并在退出时重写，跑着它改有被覆盖的风险（时间戳备份在）。
 ## 端点
 
 | 方法 | 路径 | 说明 |

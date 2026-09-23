@@ -4,15 +4,30 @@ ZCode keeps its provider table in ~/.zcode/v2/config.json, shaped like:
 
     { "provider": { "<provider-id>": { "name", "kind", "source",
                                        "options": {"baseURL", "apiKey", "apiKeyRequired"},
-                                       "models": { "<model-id>": { "limit", "modalities" } } } } }
+                                       "modelDisplayNames": {"<id>": "<label>"},
+                                       "models": {"<model-id>": {"name", "reasoning",
+                                                                 "limit", "modalities"}} } } }
 
 This script adds (or refreshes) one entry for this proxy. It is idempotent, so
 re-run it whenever models.json changes.
 
-It reads ZCode's own bundled model catalog to fill in real context/output limits
-where the model is known there; otherwise it uses the defaults below. Context and
-output limits matter - they drive when ZCode compacts a conversation, so guessing
-them wrong either compacts far too early or overflows the window.
+Each model gets a context window, an output limit, modalities, a display name
+and a reasoning switch:
+
+- Context comes from models.json's contextWindow (vendor-published, so it beats
+  any catalog guess), else the fallback below. It drives when ZCode compacts a
+  conversation.
+- Output comes from OUTPUT_OVERRIDES, else ZCode's bundled catalog if one
+  ships, else the fallback. The upstream hard-rejects params.max_tokens above
+  UPSTREAM_MAX_OUTPUT, so nothing is ever written higher than that.
+- Name comes from models.json's name and is written twice: per model (`name`)
+  and provider-wide (`modelDisplayNames`). Both are additive keys a strict
+  reader drops, so whichever ZCode honours is the one that ends up showing.
+- Reasoning is written for every model because every model on the plan is a
+  reasoning model (inkling-small included, despite its name). It is
+  intentionally cosmetic: /alpha/generate has no reasoning-effort knob, so the
+  switch cannot affect anything upstream. It is present so ZCode shows the
+  model at all rather than hiding it behind a reasoning gate.
 
 Usage:
     python install_to_zcode.py              # write to ~/.zcode/v2/config.json
@@ -33,13 +48,37 @@ PROVIDER_NAME = "CommandCode (local proxy)"
 BASE_URL = "http://127.0.0.1:55990/v1"
 PLACEHOLDER_KEY = "commandcode"
 
-# Fallbacks for models ZCode's catalog knows nothing about. Conservative on
+# Fallbacks for models nothing else says anything about. Conservative on
 # purpose: a limit that is too small only costs an earlier compaction.
 DEFAULT_CONTEXT = 262144
-DEFAULT_OUTPUT = 16384
+
+# Reasoning models spend max_tokens on thinking before they spend it on the
+# answer, so a small ceiling can produce a finished-but-empty reply. 65536 is
+# the value ZCode itself ships for a 1M-context model, which is the floor it
+# appears to use.
+DEFAULT_OUTPUT = 65536
+
 # Hard cap the upstream enforces on params.max_tokens (see
-# commandcode_proxy.upstream.UPSTREAM_MAX_TOKENS).
+# commandcode_proxy.upstream.UPSTREAM_MAX_TOKENS): 200000 is accepted, 200001
+# rejects with BAD_REQUEST. Verified on three unrelated models.
 UPSTREAM_MAX_OUTPUT = 200000
+
+# Output limits that are better than the fallback. Entries above the upstream
+# cap are recorded as the model's real ceiling and clamped at build time, so
+# the table stays honest about what the model can do.
+OUTPUT_OVERRIDES = {
+    "deepseek/deepseek-v4-pro": 384000,
+    "deepseek/deepseek-v4-flash": 384000,
+    "deepseek/deepseek-v4-flash-vision-exp": 384000,
+    "deepseek/deepseek-v4-flash-fast": 384000,
+    "deepseek/deepseek-v4.1-flash": 384000,
+    "zai-org/GLM-5.2": 128000,
+    "moonshotai/Kimi-K3": 131072,
+}
+
+# Written verbatim into every model entry. Shape matches what ZCode already
+# persists for the same vendor elsewhere in config.json.
+REASONING = {"enabled": True, "variants": ["off", "high", "max"], "defaultVariant": "max"}
 
 CONFIG = Path.home() / ".zcode" / "v2" / "config.json"
 # ZCode used to ship a date-stamped catalog JSON here. That filename changes on
@@ -87,8 +126,10 @@ def build_entry(models_json: Path, base_url: str) -> dict:
     data = json.loads(models_json.read_text(encoding="utf-8"))
     catalog = catalog_limits()
     models: dict[str, dict] = {}
+    display_names: dict[str, str] = {}
     for entry in data["models"]:
         model_id = entry["id"] if isinstance(entry, dict) else entry
+        label = entry.get("name") if isinstance(entry, dict) else None
         context, output, inputs = lookup(catalog, model_id)
         # A contextWindow in models.json is vendor-published and beats both the
         # ZCode catalog guess and DEFAULT_CONTEXT. Without it, gpt-6-luna would
@@ -96,19 +137,25 @@ def build_entry(models_json: Path, base_url: str) -> dict:
         published = entry.get("contextWindow") if isinstance(entry, dict) else None
         if isinstance(published, int) and published > 0:
             context = published
-        # The upstream rejects params.max_tokens above 200000, so an output limit
-        # ZCode cannot honour is worse than a smaller one.
-        output = min(output, UPSTREAM_MAX_OUTPUT)
+        # Per-model override beats the catalog, which beats the fallback. The
+        # upstream rejects params.max_tokens above UPSTREAM_MAX_OUTPUT, so an
+        # output limit ZCode cannot honour is worse than a smaller one.
+        output = min(OUTPUT_OVERRIDES.get(model_id, output), UPSTREAM_MAX_OUTPUT)
         # Only the *-vision model in this catalog actually accepts images; the
         # upstream tells a text-only model it got no image. Keep any other
         # modalities the catalog records, such as Kimi's video input.
         extras = [i for i in inputs if i not in ("text", "image")]
         inputs = ["text"] + (["image"] if "vision" in model_id.lower() else []) + extras
-        models[model_id] = {
+        model = {
             "limit": {"context": context, "output": output},
             "modalities": {"input": inputs, "output": ["text"]},
+            "reasoning": dict(REASONING),
             "zcode": {"modalitiesConfigured": True},
         }
+        if isinstance(label, str) and label:
+            model["name"] = label
+            display_names[model_id] = label
+        models[model_id] = model
     return {
         "name": PROVIDER_NAME,
         "kind": "openai-compatible",
@@ -119,6 +166,7 @@ def build_entry(models_json: Path, base_url: str) -> dict:
             "apiKeyRequired": True,
         },
         "models": models,
+        "modelDisplayNames": display_names,
     }
 
 
@@ -131,6 +179,9 @@ def main() -> int:
 
     entry = build_entry(Path(args.models_file), args.base_url)
     print(f"provider: {PROVIDER_ID}  models: {len(entry['models'])}  base_url: {args.base_url}")
+    print(f"named: {len(entry['modelDisplayNames'])}  "
+          f"output overrides: {len(OUTPUT_OVERRIDES)}  "
+          f"upstream cap: {UPSTREAM_MAX_OUTPUT}")
     if find_catalog() is None:
         print(f"note: no ZCode model catalog under {CATALOG_DIR}; contextWindow comes "
               "from models.json, the output limit falls back to the conservative default")
